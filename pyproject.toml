@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=42", "setuptools_scm[toml]>=6.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dtool-dserver"
+description = "dtool storage broker for accessing datasets through dserver"
+readme = "README.rst"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Lars Pastewka", email = "lars.pastewka@imtek.uni-freiburg.de"},
+]
+dynamic = ["version"]
+dependencies = [
+    "dtoolcore>=3.18.0",
+    "requests",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-cov",
+]
+
+[project.urls]
+Repository = "https://github.com/livMatS/dtool-dserver"
+
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+write_to = "dtool_dserver/version.py"
+
+[tool.setuptools]
+packages = ["dtool_dserver"]
+
+[project.entry-points."dtool.storage_brokers"]
+"DServerStorageBroker" = "dtool_dserver.storagebroker:DServerStorageBroker"
