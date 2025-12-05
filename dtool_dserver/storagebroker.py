@@ -10,10 +10,57 @@ import requests
 
 from dtoolcore.storagebroker import BaseStorageBroker
 from dtoolcore.filehasher import FileHasher, md5sum_hexdigest
-from dtoolcore.utils import generate_identifier, mkdir_parents
+from dtoolcore.utils import generate_identifier, mkdir_parents, get_config_value
+
+try:
+    from dtool_dserver import __version__
+except ImportError:
+    __version__ = "0.1.0"
 
 
 logger = logging.getLogger(__name__)
+
+
+# S3-compatible structure parameters (since dserver uploads to S3/Azure)
+_STRUCTURE_PARAMETERS = {
+    "dataset_registration_key": None,
+    "data_key_infix": "data",
+    "fragment_key_infix": "fragments",
+    "overlays_key_infix": "overlays",
+    "annotations_key_infix": "annotations",
+    "tags_key_infix": "tags",
+    "structure_key_suffix": "structure.json",
+    "dtool_readme_key_suffix": "README.txt",
+    "dataset_readme_key_suffix": "README.yml",
+    "manifest_key_suffix": "manifest.json",
+    "admin_metadata_key_suffix": "dtool",
+    "http_manifest_key": "http_manifest.json",
+    "storage_broker_version": __version__,
+}
+
+_DTOOL_README_TXT = """README
+======
+This is a Dtool dataset stored via dserver signed URL API.
+
+Content provided during the dataset creation process
+----------------------------------------------------
+
+Dataset descriptive metadata: $UUID/README.yml
+Dataset items prefixed by: $UUID/data/
+
+The item identifiers are used to name the files using the data prefix.
+
+Automatically generated files and directories
+---------------------------------------------
+
+This file: $UUID/README.txt
+Administrative metadata describing the dataset: $UUID/dtool
+Structural metadata describing the dataset: $UUID/structure.json
+Structural metadata describing the data items: $UUID/manifest.json
+Per item descriptive metadata: $UUID/overlays/
+Dataset key/value pairs metadata: $UUID/annotations/
+Dataset tags metadata: $UUID/tags/
+"""
 
 
 class DServerStorageBrokerError(Exception):
@@ -34,8 +81,13 @@ class DServerStorageBroker(BaseStorageBroker):
     2. Requests signed URLs for read/write operations
     3. Uses the signed URLs to access the actual storage
 
-    URI format: dserver://<server>/<backend>/<bucket>/<uuid>
-    Example: dserver://localhost:5000/s3/my-bucket/uuid
+    URI formats supported:
+    1. Short: dserver://<server>/<uuid> (requires DSERVER_DEFAULT_BASE_URI)
+    2. Full: dserver://<server>/<backend>/<bucket>/<uuid> (always works)
+
+    Examples:
+    - dserver://localhost:5000/550e8400-e29b-41d4-a716-446655440000
+    - dserver://localhost:5000/s3/my-bucket/550e8400-e29b-41d4-a716-446655440000
     """
 
     #: Attribute used to define the type of storage broker.
@@ -45,10 +97,21 @@ class DServerStorageBroker(BaseStorageBroker):
     #: function name to the manifest.
     hasher = FileHasher(md5sum_hexdigest)
 
+    #: Attribute used to document the structure of the dataset.
+    _dtool_readme_txt = _DTOOL_README_TXT
+
     def __init__(self, uri, config_path=None):
         self._uri = uri
         self._config_path = config_path
         self._parse_uri(uri)
+
+        # Structure parameters (copy to allow modification per instance)
+        self._structure_parameters = _STRUCTURE_PARAMETERS.copy()
+
+        # Data key prefix for items (will be set when uuid is known)
+        self.data_key_prefix = None
+        if self.uuid:
+            self.data_key_prefix = f"{self.uuid}/data/"
 
         # Caches
         self._signed_urls_cache = None
@@ -63,9 +126,11 @@ class DServerStorageBroker(BaseStorageBroker):
         self._readme_content = None
 
     def _parse_uri(self, uri):
-        """Parse dserver URI into components.
+        """Parse dserver URI with flexible format support.
 
-        URI format: dserver://<server>/<backend>/<bucket>/<uuid>
+        Supports two formats:
+        1. dserver://<server>/<uuid>  (short, requires default base_uri)
+        2. dserver://<server>/<backend>/<bucket>/<uuid>  (full path)
         """
         parsed = urlparse(uri)
 
@@ -76,27 +141,53 @@ class DServerStorageBroker(BaseStorageBroker):
         if not self._server:
             raise ValueError("Missing server in URI")
 
-        path_parts = parsed.path.strip('/').split('/')
-        if len(path_parts) < 2:
+        path_parts = [p for p in parsed.path.strip('/').split('/') if p]
+
+        if len(path_parts) == 0:
+            # Base URI for listing - no UUID specified
+            # This is valid for list_dataset_uris() operations
+            self.uuid = None
+            self._backend_uri = None
+            self._backend_base_uri = None
+            self._resolve_mode = 'default'
+            logger.debug(f"Parsed base URI (no UUID): server={self._server}, mode=default")
+            return
+
+        if len(path_parts) == 1:
+            # Format 1: Short URI - dserver://server/uuid
+            self.uuid = path_parts[0]
+            self._backend_uri = None
+            self._backend_base_uri = None
+            self._resolve_mode = 'default'
+            logger.debug(f"Parsed short URI: uuid={self.uuid}, mode=default")
+
+        elif len(path_parts) == 2:
+            # Two parts: Could be an error or incomplete path
+            # Reject this to avoid ambiguity
             raise ValueError(
                 f"Invalid dserver URI: {uri}. "
-                "Expected format: dserver://<server>/<backend>/<bucket>[/<uuid>]"
+                f"Use short format (dserver://{self._server}/<uuid>) or "
+                f"full format (dserver://{self._server}/<backend>/<bucket>/<uuid>)"
             )
 
-        self._backend = path_parts[0]  # e.g., "s3" or "azure"
-        self._bucket = path_parts[1]
-
-        if len(path_parts) >= 3:
+        elif len(path_parts) == 3:
+            # Format 3: Full path URI - dserver://server/backend/bucket/uuid
+            backend = path_parts[0]
+            bucket = path_parts[1]
             self.uuid = path_parts[2]
-        else:
-            self.uuid = None
-
-        # Reconstruct the backend URI
-        self._backend_base_uri = f"{self._backend}://{self._bucket}"
-        if self.uuid:
+            self._backend_base_uri = f"{backend}://{bucket}"
             self._backend_uri = f"{self._backend_base_uri}/{self.uuid}"
+            self._resolve_mode = 'full'
+            logger.debug(f"Parsed full URI: backend_uri={self._backend_uri}, mode=full")
+
         else:
-            self._backend_uri = None
+            # More than 3 parts - reject to avoid ambiguity
+            raise ValueError(
+                f"Invalid dserver URI: {uri}. "
+                f"Too many path components. "
+                f"Use short format (dserver://{self._server}/<uuid>) or "
+                f"full format (dserver://{self._server}/<backend>/<bucket>/<uuid>)"
+            )
 
     def _get_token(self):
         """Get authentication token from environment or file."""
@@ -120,6 +211,75 @@ class DServerStorageBroker(BaseStorageBroker):
         """Construct full URL for dserver API."""
         protocol = os.environ.get('DSERVER_PROTOCOL', 'http')
         return f"{protocol}://{self._server}{path}"
+
+    def _get_default_base_uri(self):
+        """Get default base URI from configuration.
+
+        Checks in order:
+        1. Server-specific environment variable
+        2. Generic environment variable
+        3. dtool config file (if available)
+        """
+        # First try server-specific config
+        server_key = self._server.replace(':', '_').replace('.', '_')
+        key = f"DSERVER_DEFAULT_BASE_URI_{server_key}"
+        base_uri = get_config_value(key, config_path=self._config_path)
+        if base_uri:
+            logger.debug(f"Found default base_uri from {key}: {base_uri}")
+            return base_uri
+
+        # Then try generic config
+        base_uri = get_config_value('DSERVER_DEFAULT_BASE_URI', config_path=self._config_path)
+        if base_uri:
+            logger.debug(f"Found default base_uri from DSERVER_DEFAULT_BASE_URI: {base_uri}")
+            return base_uri
+
+        return None
+
+
+    def _query_backend_uri_from_dserver(self):
+        """Query dserver to find the backend URI for this UUID.
+
+        This is used when the URI format doesn't contain enough information
+        to determine the backend URI (short format or path format).
+        """
+        try:
+            # Query the /dataset/lookup/<uuid> endpoint
+            response = self._api_request('GET', f'/dataset/lookup/{self.uuid}')
+            data = response.json()
+            backend_uri = data.get('uri')
+            if backend_uri:
+                logger.debug(f"Resolved UUID {self.uuid} to backend URI: {backend_uri}")
+                return backend_uri
+        except Exception as e:
+            logger.warning(f"Failed to query dserver for UUID {self.uuid}: {e}")
+
+        return None
+
+    def _resolve_backend_uri(self):
+        """Resolve the actual backend URI based on the parse mode.
+
+        Returns the backend URI (e.g., s3://bucket/uuid) that can be used
+        to instantiate the actual storage broker.
+        """
+        if self._backend_uri:
+            # Already resolved (full format)
+            return self._backend_uri
+
+        if self._resolve_mode == 'default':
+            # Use default base URI
+            base_uri = self._get_default_base_uri()
+            if not base_uri:
+                raise DServerStorageBrokerError(
+                    f"Short URI format requires DSERVER_DEFAULT_BASE_URI "
+                    f"configuration for server {self._server}. "
+                    f"Set DSERVER_DEFAULT_BASE_URI environment variable or add to dtool config."
+                )
+            self._backend_base_uri = base_uri
+            self._backend_uri = f"{base_uri}/{self.uuid}"
+            logger.info(f"Resolved short URI using default base_uri: {self._backend_uri}")
+
+        return self._backend_uri
 
     def _api_request(self, method, path, **kwargs):
         """Make authenticated request to dserver."""
@@ -157,16 +317,19 @@ class DServerStorageBroker(BaseStorageBroker):
     def _fetch_signed_urls(self):
         """Fetch signed URLs for reading the dataset."""
         if self._signed_urls_cache is None:
-            if self._backend_uri is None:
+            if self.uuid is None:
                 raise ValueError("No dataset UUID set")
 
-            encoded_uri = quote(self._backend_uri, safe='')
+            # Resolve backend URI if needed
+            backend_uri = self._resolve_backend_uri()
+
+            encoded_uri = quote(backend_uri, safe='')
             response = self._api_request(
                 'GET',
                 f'/signed-urls/dataset/{encoded_uri}'
             )
             self._signed_urls_cache = response.json()
-            logger.debug(f"Fetched signed URLs for {self._backend_uri}")
+            logger.debug(f"Fetched signed URLs for {backend_uri}")
         return self._signed_urls_cache
 
     def _fetch_upload_urls(self, items):
@@ -174,6 +337,10 @@ class DServerStorageBroker(BaseStorageBroker):
         if self._upload_urls_cache is None:
             if self.uuid is None:
                 raise ValueError("No dataset UUID set")
+
+            # Resolve backend base URI if needed
+            if self._backend_base_uri is None:
+                self._resolve_backend_uri()
 
             encoded_base_uri = quote(self._backend_base_uri, safe='')
             item_data = [
@@ -191,13 +358,20 @@ class DServerStorageBroker(BaseStorageBroker):
                 }
             )
             self._upload_urls_cache = response.json()
-            logger.debug(f"Fetched upload URLs for {self._backend_uri}")
+            logger.debug(f"Fetched upload URLs for {self._backend_base_uri}/{self.uuid}")
         return self._upload_urls_cache
 
     # === Read Operations ===
 
     def has_admin_metadata(self):
-        """Check if dataset exists by attempting to fetch admin metadata."""
+        """Check if dataset exists by attempting to fetch admin metadata.
+
+        Returns False if no UUID is specified (base URI for listing).
+        """
+        if self.uuid is None:
+            # This is a base URI for listing, not a dataset URI
+            return False
+
         try:
             self.get_admin_metadata()
             return True
@@ -322,28 +496,67 @@ class DServerStorageBroker(BaseStorageBroker):
         return cache_path
 
     def get_size_in_bytes(self, handle):
-        """Get size of item from manifest."""
+        """Get size of item.
+
+        For new datasets being created, reads from local file.
+        For existing datasets, reads from manifest.
+        """
+        # Check if this is a pending item (being uploaded)
+        if handle in self._pending_items:
+            fpath = self._pending_items[handle]['fpath']
+            return os.path.getsize(fpath)
+
+        # Otherwise get from manifest
         identifier = generate_identifier(handle)
         manifest = self.get_manifest()
         item = manifest.get('items', {}).get(identifier, {})
         return item.get('size_in_bytes', 0)
 
     def get_utc_timestamp(self, handle):
-        """Get timestamp of item from manifest."""
+        """Get timestamp of item.
+
+        For new datasets being created, reads from local file.
+        For existing datasets, reads from manifest.
+        """
+        # Check if this is a pending item (being uploaded)
+        if handle in self._pending_items:
+            fpath = self._pending_items[handle]['fpath']
+            return os.path.getmtime(fpath)
+
+        # Otherwise get from manifest
         identifier = generate_identifier(handle)
         manifest = self.get_manifest()
         item = manifest.get('items', {}).get(identifier, {})
         return item.get('utc_timestamp', 0)
 
     def get_hash(self, handle):
-        """Get hash of item from manifest."""
+        """Get hash of item.
+
+        For new datasets being created, computes hash from local file.
+        For existing datasets, reads from manifest.
+        """
+        # Check if this is a pending item (being uploaded)
+        if handle in self._pending_items:
+            fpath = self._pending_items[handle]['fpath']
+            return self.hasher(fpath)
+
+        # Otherwise get from manifest
         identifier = generate_identifier(handle)
         manifest = self.get_manifest()
         item = manifest.get('items', {}).get(identifier, {})
         return item.get('hash', '')
 
     def get_relpath(self, handle):
-        """Get relpath of item from manifest."""
+        """Get relpath of item.
+
+        For new datasets being created, handle is the relpath.
+        For existing datasets, reads from manifest.
+        """
+        # Check if this is a pending item (being uploaded)
+        if handle in self._pending_items:
+            return handle  # handle is the relpath for pending items
+
+        # Otherwise get from manifest
         identifier = generate_identifier(handle)
         manifest = self.get_manifest()
         item = manifest.get('items', {}).get(identifier, {})
@@ -351,9 +564,18 @@ class DServerStorageBroker(BaseStorageBroker):
 
     # === Write Operations ===
 
-    def _create_structure(self):
-        """Initialize dataset structure (for new datasets)."""
-        # Structure will be created during post_freeze_hook upload
+    def create_structure(self):
+        """Create necessary structure to hold a dataset.
+
+        For dserver broker, actual creation is deferred to post_freeze_hook
+        when we upload to storage. Here we just prepare the data key prefix.
+        """
+        logger.debug(f"Creating dataset structure for {self.uuid}")
+
+        # Set up data key prefix now that we have uuid
+        self.data_key_prefix = f"{self.uuid}/data/"
+
+        # Structure will be uploaded during post_freeze_hook
         logger.debug("Structure creation deferred to upload")
 
     def put_item(self, fpath, relpath):
@@ -430,6 +652,17 @@ class DServerStorageBroker(BaseStorageBroker):
         )
         response.raise_for_status()
 
+        # Upload structure.json
+        if 'structure' in upload_urls:
+            logger.debug("Uploading structure.json")
+            structure_data = json.dumps(self._structure_parameters, indent=2, sort_keys=True)
+            response = requests.put(
+                upload_urls['structure'],
+                data=structure_data,
+                headers={'Content-Type': 'application/json'}
+            )
+            response.raise_for_status()
+
         # Upload README
         if self._readme_content:
             logger.debug("Uploading README")
@@ -457,10 +690,12 @@ class DServerStorageBroker(BaseStorageBroker):
     def _signal_upload_complete(self):
         """Notify dserver that upload is complete."""
         logger.debug("Signaling upload complete")
+        # Make sure backend URI is resolved
+        backend_uri = self._resolve_backend_uri()
         self._api_request(
             'POST',
             '/signed-urls/upload-complete',
-            json={'uri': self._backend_uri}
+            json={'uri': backend_uri}
         )
 
     def delete_key(self, key):
@@ -506,32 +741,64 @@ class DServerStorageBroker(BaseStorageBroker):
     # === Class Methods ===
 
     @classmethod
+    def _get_default_base_uri_for_server(cls, server, config_path=None):
+        """Get default base URI for a specific server (class method version)."""
+        server_key = server.replace(':', '_').replace('.', '_')
+        key = f"DSERVER_DEFAULT_BASE_URI_{server_key}"
+        base_uri = get_config_value(key, config_path=config_path)
+        if base_uri:
+            return base_uri
+        return get_config_value('DSERVER_DEFAULT_BASE_URI', config_path=config_path)
+
+
+    @classmethod
     def list_dataset_uris(cls, base_uri, config_path=None):
-        """List datasets by querying dserver API."""
+        """List datasets by querying dserver API.
+
+        Returns URIs in the shortest format based on configuration.
+        """
         parsed = urlparse(base_uri)
         server = parsed.netloc
-        path_parts = parsed.path.strip('/').split('/')
+        path_parts = [p for p in parsed.path.strip('/').split('/') if p]
 
-        if len(path_parts) < 2:
-            raise ValueError(f"Invalid base URI: {base_uri}")
+        # Determine the backend base URI to query
+        if len(path_parts) == 0:
+            # Base URI is just dserver://server/ - use default
+            backend_base_uri = cls._get_default_base_uri_for_server(server, config_path)
+            if not backend_base_uri:
+                raise ValueError(
+                    f"Cannot list datasets from dserver://{server}/ without "
+                    "DSERVER_DEFAULT_BASE_URI configuration"
+                )
+        elif len(path_parts) == 1:
+            # Single path component - reject as ambiguous
+            raise ValueError(
+                f"Invalid base URI: {base_uri}. "
+                f"Use short format (dserver://{server}/) or "
+                f"full format (dserver://{server}/backend/bucket/)"
+            )
+        elif len(path_parts) == 2:
+            # Full format: backend/bucket
+            backend = path_parts[0]
+            bucket = path_parts[1]
+            backend_base_uri = f"{backend}://{bucket}"
+        else:
+            raise ValueError(f"Invalid base URI format: {base_uri}")
 
-        backend = path_parts[0]
-        bucket = path_parts[1]
-
-        backend_base_uri = f"{backend}://{bucket}"
-
-        # Get token
-        token = os.environ.get('DSERVER_TOKEN')
+        # Get token (check config file as well as environment)
+        token = get_config_value('DSERVER_TOKEN', config_path=config_path)
         if not token:
-            token_file = os.environ.get('DSERVER_TOKEN_FILE')
+            token_file = get_config_value('DSERVER_TOKEN_FILE', config_path=config_path)
             if token_file and os.path.exists(token_file):
                 with open(token_file) as f:
                     token = f.read().strip()
 
         if not token:
-            raise DServerAuthenticationError("No dserver token found")
+            raise DServerAuthenticationError(
+                "No dserver token found. Set DSERVER_TOKEN in environment or config file."
+            )
 
-        protocol = os.environ.get('DSERVER_PROTOCOL', 'http')
+        protocol = get_config_value('DSERVER_PROTOCOL', config_path=config_path, default='http')
 
         # Query dserver for URIs
         response = requests.post(
@@ -541,20 +808,71 @@ class DServerStorageBroker(BaseStorageBroker):
         )
         response.raise_for_status()
 
-        # Convert backend URIs to dserver URIs
+        # Convert backend URIs to dserver URIs using shortest format
         uris = []
+        default_base_uri = cls._get_default_base_uri_for_server(server, config_path)
+
         for item in response.json():
             backend_uri = item['uri']
             uuid = backend_uri.split('/')[-1]
-            dserver_uri = f"dserver://{server}/{backend}/{bucket}/{uuid}"
+            item_base_uri = backend_uri.rsplit('/', 1)[0]
+
+            # Generate shortest URI format
+            if default_base_uri and item_base_uri == default_base_uri:
+                # Use short format
+                dserver_uri = f"dserver://{server}/{uuid}"
+            else:
+                # Use full format
+                parsed_backend = urlparse(backend_uri)
+                backend_type = parsed_backend.scheme
+                bucket = parsed_backend.netloc
+                dserver_uri = f"dserver://{server}/{backend_type}/{bucket}/{uuid}"
+
             uris.append(dserver_uri)
 
         return uris
 
     @classmethod
-    def generate_uri(cls, name, uuid, base_uri):
-        """Generate URI for a new dataset."""
+    def generate_uri(cls, name, uuid, base_uri, config_path=None):
+        """Generate URI for a new dataset.
+
+        Generates the shortest valid URI based on configuration.
+        """
         parsed = urlparse(base_uri)
         server = parsed.netloc
-        path = parsed.path.strip('/')
-        return f"dserver://{server}/{path}/{uuid}"
+
+        # Parse the base_uri to determine backend base URI
+        path_parts = [p for p in parsed.path.strip('/').split('/') if p]
+
+        if len(path_parts) == 0:
+            # Base URI is dserver://server/ - use default
+            backend_base_uri = cls._get_default_base_uri_for_server(server, config_path)
+            if not backend_base_uri:
+                raise ValueError(
+                    f"Cannot generate URI from dserver://{server}/ without "
+                    "DSERVER_DEFAULT_BASE_URI configuration"
+                )
+            # Use short format
+            return f"dserver://{server}/{uuid}"
+        elif len(path_parts) == 1:
+            # Single path component - reject as ambiguous
+            raise ValueError(
+                f"Invalid base URI: {base_uri}. "
+                f"Use short format (dserver://{server}/) or "
+                f"full format (dserver://{server}/backend/bucket/)"
+            )
+        elif len(path_parts) == 2:
+            # Full format: backend/bucket
+            backend = path_parts[0]
+            bucket = path_parts[1]
+            backend_base_uri = f"{backend}://{bucket}"
+
+            # Check if this matches the default - if so, use short format
+            default_base_uri = cls._get_default_base_uri_for_server(server, config_path)
+            if default_base_uri and backend_base_uri == default_base_uri:
+                return f"dserver://{server}/{uuid}"
+
+            # Otherwise use full format
+            return f"dserver://{server}/{backend}/{bucket}/{uuid}"
+        else:
+            raise ValueError(f"Invalid base URI format: {base_uri}")
