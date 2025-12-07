@@ -132,6 +132,8 @@ class DServerStorageBroker(BaseStorageBroker):
 
         # Pending data for uploads
         self._pending_items = {}  # relpath -> {'fpath': path, 'identifier': id}
+        self._pending_tags = set()  # tag names
+        self._pending_annotations = {}  # annotation_name -> value
         self._name = None
         self._readme_content = None
 
@@ -363,8 +365,13 @@ class DServerStorageBroker(BaseStorageBroker):
             logger.debug(f"Fetched signed URLs for {backend_uri}")
         return self._signed_urls_cache
 
-    def _fetch_upload_urls(self, items):
-        """Fetch signed URLs for uploading a dataset."""
+    def _fetch_upload_urls(self):
+        """Fetch signed URLs for uploading a dataset.
+
+        Sends full dataset metadata to the server which writes admin_metadata,
+        manifest, structure, tags, and annotations directly to storage.
+        Returns URLs only for README and items.
+        """
         if self._upload_urls_cache is None:
             if self.uuid is None:
                 raise ValueError("No dataset UUID set")
@@ -374,10 +381,21 @@ class DServerStorageBroker(BaseStorageBroker):
                 self._resolve_backend_uri()
 
             encoded_base_uri = quote(self._backend_base_uri, safe='')
-            item_data = [
-                {'relpath': relpath}
-                for relpath in self._pending_items.keys()
-            ]
+
+            # Build full item metadata for manifest generation
+            item_data = []
+            for relpath, info in self._pending_items.items():
+                fpath = info['fpath']
+                item_data.append({
+                    'relpath': relpath,
+                    'size_in_bytes': os.path.getsize(fpath),
+                    'hash': self.hasher(fpath),
+                    'utc_timestamp': os.path.getmtime(fpath),
+                })
+
+            # Get creator username and frozen_at from admin metadata cache
+            creator_username = self._admin_metadata_cache.get('creator_username', 'unknown')
+            frozen_at = self._admin_metadata_cache.get('frozen_at', 0)
 
             response = self._api_request(
                 'POST',
@@ -385,7 +403,11 @@ class DServerStorageBroker(BaseStorageBroker):
                 json={
                     'uuid': self.uuid,
                     'name': self._name or self.uuid,
-                    'items': item_data
+                    'creator_username': creator_username,
+                    'frozen_at': frozen_at,
+                    'items': item_data,
+                    'tags': list(self._pending_tags),
+                    'annotations': self._pending_annotations,
                 }
             )
             self._upload_urls_cache = response.json()
@@ -653,46 +675,43 @@ class DServerStorageBroker(BaseStorageBroker):
         """Store README content (uploaded on freeze)."""
         self._readme_content = content
 
+    def put_annotation(self, annotation_name, annotation):
+        """Store annotation for upload on freeze."""
+        logger.debug(f"Staging annotation for upload: {annotation_name}")
+        self._pending_annotations[annotation_name] = annotation
+
+    def put_tag(self, tag):
+        """Store tag for upload on freeze."""
+        logger.debug(f"Staging tag for upload: {tag}")
+        self._pending_tags.add(tag)
+
+    def delete_tag(self, tag):
+        """Delete a tag - remove from pending if present."""
+        logger.debug(f"Removing pending tag: {tag}")
+        self._pending_tags.discard(tag)
+
+    def delete_annotation(self, annotation_name):
+        """Delete an annotation - remove from pending if present."""
+        logger.debug(f"Removing pending annotation: {annotation_name}")
+        self._pending_annotations.pop(annotation_name, None)
+
     def pre_freeze_hook(self):
         """Called before freezing."""
         pass
 
     def post_freeze_hook(self):
-        """Upload all data after dataset is frozen."""
+        """Upload README and items after dataset is frozen.
+
+        The server handles admin_metadata, manifest, structure, tags, and
+        annotations directly based on metadata sent in _fetch_upload_urls().
+        We only need to upload README and item files here.
+        """
         logger.info(f"Starting upload for dataset {self.uuid}")
 
-        # Get upload URLs
-        upload_info = self._fetch_upload_urls(self._pending_items)
+        # Get upload URLs - this also sends metadata to server which writes
+        # admin_metadata, manifest, structure, tags, and annotations
+        upload_info = self._fetch_upload_urls()
         upload_urls = upload_info['upload_urls']
-
-        # Upload admin metadata
-        logger.debug("Uploading admin metadata")
-        response = requests.put(
-            upload_urls['admin_metadata'],
-            data=json.dumps(self._admin_metadata_cache),
-            headers={'Content-Type': 'application/json'}
-        )
-        response.raise_for_status()
-
-        # Upload manifest
-        logger.debug("Uploading manifest")
-        response = requests.put(
-            upload_urls['manifest'],
-            data=json.dumps(self._manifest_cache),
-            headers={'Content-Type': 'application/json'}
-        )
-        response.raise_for_status()
-
-        # Upload structure.json
-        if 'structure' in upload_urls:
-            logger.debug("Uploading structure.json")
-            structure_data = json.dumps(self._structure_parameters, indent=2, sort_keys=True)
-            response = requests.put(
-                upload_urls['structure'],
-                data=structure_data,
-                headers={'Content-Type': 'application/json'}
-            )
-            response.raise_for_status()
 
         # Upload README
         if self._readme_content:
