@@ -73,6 +73,16 @@ class DServerAuthenticationError(DServerStorageBrokerError):
     pass
 
 
+class DServerDatasetNotFoundError(DServerStorageBrokerError):
+    """Dataset not found on dserver."""
+    pass
+
+
+class DServerNotImplementedError(DServerStorageBrokerError):
+    """Feature not implemented on dserver or storage backend."""
+    pass
+
+
 class DServerStorageBroker(BaseStorageBroker):
     """Storage broker that accesses datasets through dserver signed URLs.
 
@@ -292,9 +302,30 @@ class DServerStorageBroker(BaseStorageBroker):
             response.raise_for_status()
             return response
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
+            status_code = e.response.status_code
+            # Try to extract error description from JSON response
+            # Flask-smorest uses 'message', werkzeug uses 'description'
+            try:
+                error_data = e.response.json()
+                description = (
+                    error_data.get('message') or
+                    error_data.get('description') or
+                    str(e)
+                )
+            except (ValueError, KeyError):
+                description = str(e)
+
+            if status_code == 401:
                 raise DServerAuthenticationError(
                     "Authentication failed. Check your token."
+                )
+            elif status_code == 404:
+                raise DServerDatasetNotFoundError(
+                    f"Dataset not found on dserver: {description}"
+                )
+            elif status_code == 501:
+                raise DServerNotImplementedError(
+                    f"Operation not supported by dserver or storage backend: {description}"
                 )
             raise DServerStorageBrokerError(f"API request failed: {e}")
         except requests.exceptions.RequestException as e:

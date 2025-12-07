@@ -11,6 +11,19 @@ except PackageNotFoundError:
     # package is not installed
     __version__ = "0.0.0"
 
-from .storagebroker import DServerStorageBroker
+from .storagebroker import (
+    DServerStorageBroker,
+    DServerStorageBrokerError,
+    DServerAuthenticationError,
+    DServerDatasetNotFoundError,
+    DServerNotImplementedError,
+)
 
-__all__ = ['DServerStorageBroker', '__version__']
+__all__ = [
+    'DServerStorageBroker',
+    'DServerStorageBrokerError',
+    'DServerAuthenticationError',
+    'DServerDatasetNotFoundError',
+    'DServerNotImplementedError',
+    '__version__',
+]
