@@ -174,13 +174,15 @@ class DServerStorageBroker(BaseStorageBroker):
             logger.debug(f"Parsed short URI: uuid={self.uuid}, mode=default")
 
         elif len(path_parts) == 2:
-            # Two parts: Could be an error or incomplete path
-            # Reject this to avoid ambiguity
-            raise ValueError(
-                f"Invalid dserver URI: {uri}. "
-                f"Use short format (dserver://{self._server}/<uuid>) or "
-                f"full format (dserver://{self._server}/<backend>/<bucket>/<uuid>)"
-            )
+            # Format 2: Base URI with backend/bucket - dserver://server/backend/bucket
+            # This is valid for copy operations where the UUID is not yet known
+            backend = path_parts[0]
+            bucket = path_parts[1]
+            self.uuid = None
+            self._backend_base_uri = f"{backend}://{bucket}"
+            self._backend_uri = None
+            self._resolve_mode = 'full'
+            logger.debug(f"Parsed base URI with backend: backend_base_uri={self._backend_base_uri}, mode=full")
 
         elif len(path_parts) == 3:
             # Format 3: Full path URI - dserver://server/backend/bucket/uuid
