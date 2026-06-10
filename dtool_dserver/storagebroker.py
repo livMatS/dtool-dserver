@@ -275,7 +275,7 @@ class DServerStorageBroker(BaseStorageBroker):
                 f'/signed-urls/dataset/{encoded_uri}'
             )
             self._signed_urls_cache = response.json()
-            logger.debug(f"Fetched signed URLs for {backend_uri}")
+            logger.debug(f"Fetched signed URLs for {self._backend_uri}")
         return self._signed_urls_cache
 
     def _fetch_upload_urls(self):
