@@ -291,15 +291,27 @@ class DServerStorageBroker(BaseStorageBroker):
 
             encoded_base_uri = quote(self._backend_base_uri, safe='')
 
-            # Build full item metadata for manifest generation
+            # Build full item metadata for manifest generation. The manifest
+            # has already been generated (and the hashes computed) by
+            # dtoolcore's freeze() via put_manifest before post_freeze_hook
+            # runs, so reuse it instead of hashing every file a second time.
+            manifest = self._manifest_cache or {}
+            manifest_items = manifest.get('items', {})
             item_data = []
             for relpath, info in self._pending_items.items():
-                fpath = info['fpath']
+                item_properties = manifest_items.get(info['identifier'])
+                if item_properties is None:
+                    fpath = info['fpath']
+                    item_properties = {
+                        'size_in_bytes': os.path.getsize(fpath),
+                        'hash': self.hasher(fpath),
+                        'utc_timestamp': os.path.getmtime(fpath),
+                    }
                 item_data.append({
                     'relpath': relpath,
-                    'size_in_bytes': os.path.getsize(fpath),
-                    'hash': self.hasher(fpath),
-                    'utc_timestamp': os.path.getmtime(fpath),
+                    'size_in_bytes': item_properties['size_in_bytes'],
+                    'hash': item_properties['hash'],
+                    'utc_timestamp': item_properties['utc_timestamp'],
                 })
 
             # Get name, creator username and frozen_at from admin metadata,
@@ -317,6 +329,7 @@ class DServerStorageBroker(BaseStorageBroker):
                     'name': name,
                     'creator_username': creator_username,
                     'frozen_at': frozen_at,
+                    'hash_function': manifest.get('hash_function', self.hasher.name),
                     'items': item_data,
                     'tags': list(self._pending_tags),
                     'annotations': self._pending_annotations,
@@ -638,14 +651,18 @@ class DServerStorageBroker(BaseStorageBroker):
             )
             response.raise_for_status()
 
-        # Upload items
+        # Upload items. The server may pin headers (object metadata,
+        # Content-MD5) into the signed URL; they must be sent verbatim so
+        # the storage backend can verify the uploaded content.
         for relpath, info in self._pending_items.items():
             identifier = info['identifier']
             item_upload_info = upload_urls['items'].get(identifier)
             if item_upload_info:
                 logger.debug(f"Uploading item: {relpath}")
+                headers = item_upload_info.get('headers') or {}
                 with open(info['fpath'], 'rb') as f:
-                    response = requests.put(item_upload_info['url'], data=f)
+                    response = requests.put(
+                        item_upload_info['url'], data=f, headers=headers)
                     response.raise_for_status()
 
         # Signal upload complete to trigger indexing
