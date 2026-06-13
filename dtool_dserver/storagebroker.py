@@ -222,12 +222,14 @@ class DServerStorageBroker(BaseStorageBroker):
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code
             # Try to extract error description from JSON response
-            # Flask-smorest uses 'message', werkzeug uses 'description'
+            # Flask-smorest uses 'message', werkzeug uses 'description',
+            # flask-jwt-extended uses 'msg'
             try:
                 error_data = e.response.json()
                 description = (
                     error_data.get('message') or
                     error_data.get('description') or
+                    error_data.get('msg') or
                     str(e)
                 )
             except (ValueError, KeyError):
@@ -235,7 +237,8 @@ class DServerStorageBroker(BaseStorageBroker):
 
             if status_code == 401:
                 raise DServerAuthenticationError(
-                    "Authentication failed. Check your token."
+                    f"Authentication failed ({description}). "
+                    f"Check your token."
                 )
             elif status_code == 404:
                 raise DServerDatasetNotFoundError(

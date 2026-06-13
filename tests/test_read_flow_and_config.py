@@ -129,6 +129,27 @@ def test_protocol_from_config_file(tmp_path, monkeypatch):
     assert broker._get_server_url("/x") == f"https://{SERVER}/x"
 
 
+def test_api_401_surfaces_server_reason(broker, monkeypatch):
+    import requests
+
+    class Fake401Response:
+        status_code = 401
+
+        def json(self):
+            # flask-jwt-extended reports the reason under 'msg'
+            return {"msg": "Token has expired"}
+
+        def raise_for_status(self):
+            raise requests.exceptions.HTTPError(
+                "401 Client Error", response=self)
+
+    monkeypatch.setattr(
+        sbmod.requests, "request", lambda *a, **kw: Fake401Response())
+
+    with pytest.raises(DServerAuthenticationError, match="Token has expired"):
+        broker._api_request("GET", "/x")
+
+
 def test_missing_token_raises(monkeypatch, tmp_path):
     monkeypatch.delenv("DSERVER_TOKEN", raising=False)
     monkeypatch.delenv("DSERVER_TOKEN_FILE", raising=False)
